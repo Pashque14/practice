@@ -16,7 +16,9 @@ DOCS_DIR = "docs"
 def get_available_documents():
     if not os.path.exists(DOCS_DIR):
         return []
-    return [f for f in os.listdir(DOCS_DIR) if f.endswith('.pdf')]
+    # Добавили новые расширения!
+    allowed_extensions = ('.pdf', '.txt', '.docx', '.doc', '.png', '.jpg', '.jpeg')
+    return [f for f in os.listdir(DOCS_DIR) if f.lower().endswith(allowed_extensions)]
 
 
 def main():
@@ -48,7 +50,7 @@ def main():
         print("🔍 Выполняю предварительный анализ базы (Pre-search)...")
 
         # ЭТАП 1: ПРИСТРЕЛОЧНЫЙ ПОИСК
-        raw_results = db.similarity_search(query, k=15)
+        raw_results = db.similarity_search(query, k=50)
 
         suggested_files = []
         for doc in raw_results:
@@ -111,7 +113,22 @@ def main():
 
         search_kwargs = {"k": 15}
         if filter_path:
-            search_kwargs["filter"] = {"source": filter_path}
+            just_filename = os.path.basename(filter_path)
+
+            # Обходим баги Windows: ищем точную строку в памяти самой базы
+            exact_source = None
+            all_data = db.get()
+            for meta in all_data['metadatas']:
+                if meta and 'source' in meta and just_filename in meta['source']:
+                    exact_source = meta['source']
+                    break
+
+            # Если нашли точный путь — используем самый надежный фильтр (строгое равенство)
+            if exact_source:
+                search_kwargs["filter"] = {"source": exact_source}
+            else:
+                print(f"\n⚠️ Текст из файла {just_filename} не найден в базе!")
+                continue
 
         base_retriever = db.as_retriever(search_kwargs=search_kwargs)
 
@@ -129,12 +146,24 @@ def main():
         # 3. Реранкер оценивает каждую пару от 0 до 1 (насколько текст отвечает на вопрос)
         scores = reranker.predict(sentence_pairs)
 
-        # 4. Склеиваем документы с их оценками и сортируем от лучших к худшим
         scored_docs = list(zip(raw_docs, scores))
         scored_docs.sort(key=lambda x: x[1], reverse=True)
 
-        # 5. Оставляем только топ-3 самых лучших фрагмента
-        final_docs = [doc for doc, score in scored_docs[:3]]
+        # --- НОВАЯ ЗАЩИТА: Отсекаем мусор ---
+        # Оставляем только те документы, где реранкер уверен хотя бы на 15%
+        good_docs = [(doc, score) for doc, score in scored_docs if score > 0.15]
+
+        if not good_docs:
+            print("\n=== ОТВЕТ ===")
+            print("Алгоритм не нашел в базе точных совпадений для ответа (всё отсеяно по низкой релевантности).")
+            print("\n" + "-" * 60)
+            continue
+
+        # Берем ДО 3 хороших кусков (если нашелся только 1 хороший — возьмем только 1)
+        final_docs = [doc for doc, score in good_docs[:3]]
+        context_text = "\n\n---\n\n".join([doc.page_content for doc in final_docs])
+
+        # ... дальше идет формирование prompt (без изменений) ...
 
         # Формируем текст для LLM из лучших кусков
         context_text = "\n\n---\n\n".join([doc.page_content for doc in final_docs])

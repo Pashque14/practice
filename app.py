@@ -10,14 +10,13 @@ warnings.filterwarnings("ignore")
 
 CHROMA_PATH = "chroma_db"
 DOCS_DIR = "docs"
+# Добавили новые расширения для отображения в меню
+ALLOWED_EXTENSIONS = ('.pdf', '.txt', '.docx', '.doc', '.png', '.jpg', '.jpeg')
 
 # 1. Настройки страницы (Обязательно первой строкой!)
 st.set_page_config(page_title="RAG База Знаний", page_icon="📚", layout="wide")
 
 
-# 2. Кэширование тяжелых моделей
-# Это важнейшая функция! Она загружает LLM и базы только 1 раз при запуске,
-# иначе интерфейс зависал бы на 5 секунд после каждого клика.
 @st.cache_resource
 def load_system():
     embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
@@ -30,7 +29,8 @@ def load_system():
 def get_available_documents():
     if not os.path.exists(DOCS_DIR):
         return []
-    return [f for f in os.listdir(DOCS_DIR) if f.endswith('.pdf')]
+    # Фильтруем по всем поддерживаемым форматам
+    return [f for f in os.listdir(DOCS_DIR) if f.lower().endswith(ALLOWED_EXTENSIONS)]
 
 
 # --- ИНТЕРФЕЙС ---
@@ -38,7 +38,6 @@ def get_available_documents():
 st.title("📚 Корпоративная база знаний (RAG)")
 st.markdown("Задайте вопрос, и нейросеть найдет ответ в загруженных документах.")
 
-# Загрузка системы (покажет крутилку при первом запуске)
 with st.spinner("Загрузка нейросетей и базы данных..."):
     db, llm, reranker = load_system()
 
@@ -47,23 +46,20 @@ with st.sidebar:
     st.header("⚙️ Настройки поиска")
     docs_list = get_available_documents()
 
-    # Выпадающий список документов
     options = ["Искать везде"] + docs_list
     selected_doc = st.selectbox("Где искать ответ?", options)
 
-    filter_path = None
+    filter_filename = None
     if selected_doc != "Искать везде":
-        filter_path = os.path.join(DOCS_DIR, selected_doc)
+        filter_filename = selected_doc
         st.success(f"Фильтр включен: {selected_doc}")
     else:
         st.info("Поиск по всей базе")
 
 # --- ИСТОРИЯ ЧАТА ---
-# Сохраняем сообщения в сессии, чтобы они не пропадали
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
-# Отрисовываем старые сообщения
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
@@ -74,19 +70,31 @@ for msg in st.session_state.messages:
 # --- ПОЛЕ ВВОДА ---
 if query := st.chat_input("Спросите что-нибудь"):
 
-    # 1. Выводим вопрос пользователя
     st.session_state.messages.append({"role": "user", "content": query})
     with st.chat_message("user"):
         st.markdown(query)
 
-    # 2. Выводим ответ ассистента
     with st.chat_message("assistant"):
         with st.spinner("Анализирую документы и генерирую ответ..."):
 
-            # --- ЛОГИКА ПОИСКА (Как в консоли) ---
-            search_kwargs = {"k": 15}
-            if filter_path:
-                search_kwargs["filter"] = {"source": filter_path}
+            search_kwargs = {"k": 50}
+
+            # --- УМНЫЙ ФИЛЬТР ПУТЕЙ WINDOWS (Перенесли из main.py) ---
+            if filter_filename:
+                exact_source = None
+                all_data = db.get()
+                if all_data and 'metadatas' in all_data:
+                    for meta in all_data['metadatas']:
+                        if meta and 'source' in meta and filter_filename in meta['source']:
+                            exact_source = meta['source']
+                            break
+
+                if exact_source:
+                    search_kwargs["filter"] = {"source": exact_source}
+                else:
+                    st.warning(f"Текст из файла {filter_filename} не найден в базе!")
+                    # Ставим заглушку, чтобы поиск ничего не нашел, раз файла нет в базе
+                    search_kwargs["filter"] = {"source": "NON_EXISTENT_FILE"}
 
             base_retriever = db.as_retriever(search_kwargs=search_kwargs)
             raw_docs = base_retriever.invoke(query)
@@ -94,15 +102,29 @@ if query := st.chat_input("Спросите что-нибудь"):
             if not raw_docs:
                 st.warning("В выбранном источнике нет релевантной информации.")
             else:
-                # Реранжирование
                 sentence_pairs = [[query, doc.page_content] for doc in raw_docs]
                 scores = reranker.predict(sentence_pairs)
 
                 scored_docs = list(zip(raw_docs, scores))
                 scored_docs.sort(key=lambda x: x[1], reverse=True)
-                final_docs = [doc for doc, score in scored_docs[:3]]
 
+                # --- НОВАЯ ЗАЩИТА: Отсекаем мусор ---
+                # Оставляем только те документы, где реранкер уверен хотя бы на 15%
+                good_docs = [(doc, score) for doc, score in scored_docs if score > 0.15]
+
+                if not good_docs:
+                    st.warning("Алгоритм не нашел в базе точных совпадений для ответа.")
+                    st.session_state.messages.append({
+                        "role": "assistant",
+                        "content": "К сожалению, в загруженных документах нет информации для ответа на этот вопрос."
+                    })
+                    st.rerun()
+
+                # Берем ДО 3 хороших кусков (если нашелся только 1 хороший — возьмем только 1)
+                final_docs = [doc for doc, score in good_docs[:3]]
                 context_text = "\n\n---\n\n".join([doc.page_content for doc in final_docs])
+
+                # ... дальше идет формирование prompt (без изменений) ...
 
                 prompt = f"""Ты — точный ИИ-аналитик. Твоя задача — извлечь ответ на вопрос пользователя из предоставленного текста.
 Строгие правила:
@@ -116,24 +138,18 @@ if query := st.chat_input("Спросите что-нибудь"):
 Вопрос: {query}
 Ответ:"""
 
-                # Получаем ответ от Saiga
                 answer = llm.invoke(prompt).strip()
-
-                # Печатаем ответ в интерфейс
                 st.markdown(answer)
 
-                # Формируем красивый текст источников
                 sources_md = ""
                 for i, (doc, score) in enumerate(scored_docs[:3], 1):
                     source = doc.metadata.get('source', 'Неизвестный файл')
                     page = doc.metadata.get('page', '?')
                     sources_md += f"**{i}. {os.path.basename(source)}** (Стр. {page}) — *Релевантность: {score:.2f}*\n\n"
 
-                # Прячем источники в выпадающую плашку (спойлер)
                 with st.expander("Посмотреть источники"):
                     st.markdown(sources_md)
 
-                # Сохраняем в историю
                 st.session_state.messages.append({
                     "role": "assistant",
                     "content": answer,
